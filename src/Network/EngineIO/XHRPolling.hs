@@ -10,6 +10,7 @@ import Network.Wai.Handler.Warp
 import Control.Monad.Trans.Resource
 import Control.Monad.IO.Class (liftIO)
 import Network.HTTP.Types.Status
+import Network.HTTP.Types.Method
 import Control.Concurrent
 import Data.Map.Strict as Map (Map, insertLookupWithKey, updateLookupWithKey)
 import qualified Data.Map.Strict as Map
@@ -19,6 +20,7 @@ import Data.IORef
 import Data.Maybe
 import Control.Monad
 import qualified Data.ByteString.Char8 as BS -- TODO import encoding instead of Char8?
+import qualified Data.ByteString.Lazy.Char8 as BSL
 import Control.Applicative
 
 import Network.EngineIO
@@ -29,48 +31,57 @@ import Network.EngineIO
 -- TODO restrict to /engine.io
 -- STEP-1: Transport establishes a connection
 app :: State -> Application
-app State{ clientMapRef = cmr } Request{ queryString = queryItems } = runResourceT . liftIO $ do
-  case fromMaybe "" <$> lookup "sid" queryItems of
-    Just querySid -> do
-      case fromString (BS.unpack querySid) of
-        Nothing -> error "sid uuid in bad format" -- TODO handle bad UUID string format
-        Just s  -> do m'client <- lookupClient s <$> readIORef cmr
-                      case m'client of
-                        Nothing -> do putStrLn $ "client with SID " ++ show s ++ " is not known"
-                                      return $ responseLBS status200 [] "" -- TODO respond error
-                        Just Client{ mvar } -> respondMvar mvar
-
-    Nothing -> do
-      -- A new client, put them into the clientMap and wait until they get a message
-      m <- newEmptyMVar
-      newSid <- nextRandom
-      failed <- atomicWithClientMap cmr (addClient (Client m newSid))
-      if failed
-        then do
-          putStrLn "client already polling"
-          return $ responseLBS status200 [] "" -- TODO respond error
-        else do
-          -- STEP-2: Respond OPEN packet
-          -- TODO make parameter
-          -- TODO implement flashsocket, websocket
-          let transports = [Polling] -- TODO should this be "Polling" instead?
-          -- TODO use Builder
-          let openPacket = Packet Open $ Just $ mconcat
-                             [ "{ \"sid\": \"",       sid, "\""
-                             , ", \"upgrades\": ",    upgrades
-                             , ", \"pingTimeout\": ", pingTimeout
-                             , " }"]
-              sid = BS.pack (toString newSid)
-              upgrades = encodeTransports transports
-              -- TODO make parameter
-              -- TODO is this ms? Check protocol
-              pingTimeout = "1000"
-
-          return $ responseLBS status200 [] $ encodePayload (Payload [openPacket])
+app State{ clientMapRef = cmr } Request{ requestMethod = method, queryString = queryItems }
+  | method == methodGet  = handleGet
+  | method == methodPost = handlePost
+  | otherwise            = warn "bad method"
   where
+
+    handleGet = runResourceT . liftIO $ do
+      case fromMaybe "" <$> lookup "sid" queryItems of
+        Just querySid -> do
+          case fromString (BS.unpack querySid) of
+            Nothing -> warn "sid uuid in bad format"
+            Just s  -> do m'client <- lookupClient s <$> readIORef cmr
+                          case m'client of
+                            Nothing -> warn $ "client with SID " ++ show s ++ " is not known"
+                            Just Client{ mvar } -> respondMvar mvar
+
+        Nothing -> do
+          -- A new client, put them into the clientMap and wait until they get a message
+          m <- newEmptyMVar
+          newSid <- nextRandom
+          failed <- atomicWithClientMap cmr (addClient (Client m newSid))
+          if failed
+            then warn "client already polling"
+            else do
+              -- STEP-2: Respond OPEN packet
+              -- TODO make parameter
+              -- TODO implement flashsocket, websocket
+              let transports = [Polling] -- TODO should this be "Polling" instead?
+              -- TODO use Builder
+              let openPacket = Packet Open $ Just $ mconcat
+                                 [ "{ \"sid\": \"",       sid, "\""
+                                 , ", \"upgrades\": ",    upgrades
+                                 , ", \"pingTimeout\": ", pingTimeout
+                                 , " }"]
+                  sid = BS.pack (toString newSid)
+                  upgrades = encodeTransports transports
+                  -- TODO make parameter
+                  -- TODO is this ms? Check protocol
+                  pingTimeout = "1000"
+
+              return $ responseLBS status200 [] $ encodePayload (Payload [openPacket])
+
+    handlePost = warn "not implemented"
+
     respondMvar m = do
       payload <- takeMVar m
       return $ responseLBS status200 [] (encodePayload payload)
+
+    warn msg = do
+      liftIO $ putStrLn msg
+      return $ responseLBS status500 [] (BSL.pack msg) -- TODO send some proper json?
 
 data Client = Client
   { mvar :: MVar Payload
