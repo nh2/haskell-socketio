@@ -69,7 +69,7 @@ app State{ clientMapRef = cmr } Request{ queryString = queryItems } = runResourc
           return $ responseLBS status200 [] $ encodePayload (Payload [openPacket])
   where
     respondMvar m = do
-      payload <- readMVar m
+      payload <- takeMVar m
       return $ responseLBS status200 [] (encodePayload payload)
 
 data Client = Client
