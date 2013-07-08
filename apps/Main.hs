@@ -1,4 +1,6 @@
 module Main where
 
+import qualified Network.EngineIO.XHRPolling as XHR
+
 main :: IO ()
-main = putStrLn "nothing yet"
+main = XHR.main

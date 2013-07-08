@@ -7,6 +7,8 @@ module Network.EngineIO
   , Payload (..)
   , Transport (..)
   , packetTypeLabel
+  , transportLabel
+  , encodeTransports
 
   -- * Packets
   , encodePacket
@@ -18,11 +20,11 @@ module Network.EngineIO
   ) where
 
 import Control.Applicative
+import Data.List (intersperse)
 import Data.Monoid
-import Data.Maybe
 import Data.ByteString (ByteString)
-import Data.ByteString.Lazy.Builder (byteString, toLazyByteString)
-import Data.ByteString.Lazy.Builder.ASCII (intDec)
+import Data.ByteString.Lazy.Builder (byteString, lazyByteString, toLazyByteString, char7)
+import Data.ByteString.Lazy.Builder.ASCII (intDec, int64Dec)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import Data.Attoparsec.Char8 as A
@@ -30,6 +32,7 @@ import Data.Attoparsec.Char8 as A
 
 -- * Packets, Payloads and Transports
 
+-- TODO Embed data in constructors (e.g. for open)?
 -- | See <https://github.com/LearnBoost/engine.io-client/blob/master/SPEC.md>.
 data PacketType = Open
                 | Close
@@ -49,10 +52,13 @@ data Payload = Payload [Packet]
              deriving (Eq, Show)
 
 
+-- TODO this should be local to where the decision is made
+-- data PollingType = XHR | JSONP
+--                  deriving (Eq, Show)
+
 data Transport = Websocket
                | Flashsocket
-               | Jsonp       -- ^ Polling
-               | Xhr         -- ^ Polling
+               | Polling     -- ^ whenther JSONP or XHR is decided based on request URL
                deriving (Eq, Show)
 
 
@@ -79,6 +85,22 @@ packetTypeFromNumber n = case n of
   _ -> Left $ show n ++ " is not an engine.io packet type"
 
 
+transportLabel :: Transport -> ByteString
+transportLabel t = case t of
+  Websocket   -> "websocket"
+  Flashsocket -> "flashsocket"
+  Polling     -> "polling"
+
+
+encodeTransports :: [Transport] -> ByteString
+encodeTransports ts = BSL.toStrict . toLazyByteString .
+  -- TODO look up the fastest way in the builder doc, there is an example
+  mconcat $ [ char7 '[' ]
+            ++ intersperse (char7 ',') [ char7 '"' <> byteString (transportLabel t) <> char7 '"' | t <- ts ]
+            ++ [ char7 ']' ]
+
+
+
 -- * Helpers
 
 asParser :: (a -> Either String b) -> Parser a -> Parser b
@@ -101,15 +123,16 @@ parserError = "parser error"
 -- TODO don't use show
 -- | Encodes a packet.
 --
--- ><packet type id> [ `:` <data> ]
+-- ><packet type id> [ <data> ]
 --
 -- Example:
 --
--- >5:hello world
+-- >5hello world
 -- >3
 -- >4
-encodePacket :: Packet -> ByteString
-encodePacket (Packet t m'msg) = packetTypeLabel t <> fromMaybe "" m'msg
+encodePacket :: Packet -> BSL.ByteString
+encodePacket (Packet t m'msg) = toLazyByteString $ intDec (fromEnum t) <>
+                                                   maybe mempty byteString m'msg
 
 
 -- | Decodes a packet. See `encodePacket`.
@@ -135,9 +158,10 @@ parsePacket = do
 -- Example:
 --
 -- >11:hello world2:hi
-encodePayload :: Payload -> ByteString
-encodePayload (Payload ps) = BSL.toStrict . toLazyByteString $
-  mconcat [ intDec (BS.length msg) <> byteString msg | msg <- map encodePacket ps ]
+encodePayload :: Payload -> BSL.ByteString
+encodePayload (Payload []) = "0:"
+encodePayload (Payload ps) = toLazyByteString $
+  mconcat [ int64Dec (BSL.length msg) <> char7 ':' <> lazyByteString msg | msg <- map encodePacket ps ]
 
 
 -- TODO What does this sentence mean?
