@@ -37,6 +37,7 @@ library
     , uuid >= 1.2.13
     , containers >= 0.5
     , transformers >= 0.3
+    , conduit >= 1.0.5
   ghc-options:
     -Wall -fwarn-unused-imports
 

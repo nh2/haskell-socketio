@@ -48,8 +48,8 @@ data Packet = Packet PacketType (Maybe ByteString)
             deriving (Eq, Show)
 
 -- | Invariant: There is at least one packet
-data Payload = Payload [Packet]
-             deriving (Eq, Show)
+newtype Payload = Payload [Packet]
+                deriving (Eq, Show)
 
 
 -- TODO this should be local to where the decision is made

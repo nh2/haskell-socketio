@@ -6,9 +6,10 @@ module Network.EngineIO.XHRPolling
 
 import Network.Wai
 import Data.Monoid
+import Data.Conduit
+import Data.Conduit.Binary (sinkLbs)
 import Network.Wai.Handler.Warp
-import Control.Monad.Trans.Resource
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class
 import Network.HTTP.Types.Status
 import Network.HTTP.Types.Method
 import Control.Concurrent
@@ -31,53 +32,84 @@ import Network.EngineIO
 -- TODO restrict to /engine.io
 -- STEP-1: Transport establishes a connection
 app :: State -> Application
-app State{ clientMapRef = cmr } Request{ requestMethod = method, queryString = queryItems }
-  | method == methodGet  = handleGet
+app State{ clientMapRef = cmr } Request{ requestMethod = method, queryString = queryItems, requestBody = body, requestBodyLength = bodyLength }
+  | method == methodGet  = runResourceT . liftIO $ handleGet
   | method == methodPost = handlePost
   | otherwise            = warn "bad method"
   where
 
-    handleGet = runResourceT . liftIO $ do
-      case fromMaybe "" <$> lookup "sid" queryItems of
-        Just querySid -> do
-          case fromString (BS.unpack querySid) of
-            Nothing -> warn "sid uuid in bad format"
-            Just s  -> do m'client <- lookupClient s <$> readIORef cmr
-                          case m'client of
-                            Nothing -> warn $ "client with SID " ++ show s ++ " is not known"
-                            Just Client{ mvar } -> respondMvar mvar
+    withClient :: (MonadIO m) => BS.ByteString -> (Client -> m Response) -> m Response
+    withClient sid f = case fromString (BS.unpack sid) of
+      Nothing -> warn "sid uuid in bad format"
+      Just s  -> do m'client <- lookupClient s `liftM` liftIO (readIORef cmr)
+                    case m'client of
+                      Nothing -> warn $ "client with SID " ++ show s ++ " is not known"
+                      Just c  -> f c
 
-        Nothing -> do
-          -- A new client, put them into the clientMap and wait until they get a message
-          m <- newEmptyMVar
-          newSid <- nextRandom
-          failed <- atomicWithClientMap cmr (addClient (Client m newSid))
-          if failed
-            then warn "client already polling"
-            else do
-              -- STEP-2: Respond OPEN packet
-              -- TODO make parameter
-              -- TODO implement flashsocket, websocket
-              let transports = [Polling] -- TODO should this be "Polling" instead?
-              -- TODO use Builder
-              let openPacket = Packet Open $ Just $ mconcat
-                                 [ "{ \"sid\": \"",       sid, "\""
-                                 , ", \"upgrades\": ",    upgrades
-                                 , ", \"pingTimeout\": ", pingTimeout
-                                 , " }"]
-                  sid = BS.pack (toString newSid)
-                  upgrades = encodeTransports transports
-                  -- TODO make parameter
-                  -- TODO is this ms? Check protocol
-                  pingTimeout = "1000"
+    handleGet = case fromMaybe "" <$> lookup "sid" queryItems of
+      Just querySid -> withClient querySid $ \Client{ mvar } -> respondMvar mvar
 
-              return $ responseLBS status200 [] $ encodePayload (Payload [openPacket])
+      Nothing -> do
+        -- A new client, put them into the clientMap and wait until they get a message
+        m <- newEmptyMVar
+        newSid <- nextRandom
+        failed <- atomicWithClientMap cmr (addClient (Client m newSid))
+        if failed
+          then warn "client already polling"
+          else do
+            -- STEP-2: Respond OPEN packet
+            -- TODO make parameter
+            -- TODO implement flashsocket, websocket
+            let transports = [Polling] -- TODO should this be "Polling" instead?
+            -- TODO use Builder
+            let openPacket = Packet Open $ Just $ mconcat
+                               [ "{ \"sid\": \"",        sid, "\""
+                               , ", \"upgrades\": ",     upgrades
+                               , ", \"pingTimeout\": ",  pingTimeout
+                               , ", \"pingInterval\": ", pingInterval
+                               , " }"]
+                sid = BS.pack (toString newSid)
+                upgrades = encodeTransports transports
+                -- TODO make parameter
+                -- TODO is this ms? Check protocol
+                pingTimeout  = "1000"
+                pingInterval = "1000"
 
-    handlePost = warn "not implemented"
+            respondOk $ encodePayload (Payload [openPacket])
+
+    handlePost = case fromMaybe "" <$> lookup "sid" queryItems of
+      Nothing       -> warn "missing sid"
+      Just querySid -> withClient querySid $ \Client{ mvar } -> do
+        case bodyLength of
+          ChunkedBody -> warn "chunked POSTs are not allowed"
+          KnownLength _ -> do
+            allBody <- body $$ sinkLbs -- sinkLBS forces the whole LBS already
+            case decodePayload (BSL.toStrict allBody) of
+              Left err                -> warn err
+              Right (Payload [])      -> warn "no packets in client payload"
+              Right (Payload packets) -> go packets
+                where
+                  -- TODO use some maybe construction for this, manual looping bah
+                  go []     = respondOk "" -- all fine
+                  go (p:ps) = do
+                    case p of
+                      Packet Ping _ -> do liftIO $ putStrLn "responding ping with pong ..."
+                                          liftIO . putMVar mvar $ Payload [Packet Pong Nothing]
+                                          liftIO $ putStrLn "responded pong"
+                                          go ps
+                      Packet Close _ -> do liftIO $ putStrLn "received close"
+                                           -- TODO not sure if we should send noop; we have to put something into the mvar
+                                           liftIO . putMVar mvar $ Payload [Packet Noop Nothing]
+                                           go ps
+                      Packet typ _  -> warn $ "unhandled POST packet type " ++ show typ
+                                       -- don't process remaining packages ps
+
 
     respondMvar m = do
       payload <- takeMVar m
-      return $ responseLBS status200 [] (encodePayload payload)
+      respondOk (encodePayload payload)
+
+    respondOk bs = return $ responseLBS status200 [] bs
 
     warn msg = do
       liftIO $ putStrLn msg
