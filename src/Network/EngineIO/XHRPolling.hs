@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, NamedFieldPuns, ExistentialQuantification #-}
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns, ExistentialQuantification, LambdaCase #-}
 
 module Network.EngineIO.XHRPolling
   ( main
@@ -32,98 +32,117 @@ import Network.EngineIO
 -- TODO restrict to /engine.io
 -- STEP-1: Transport establishes a connection
 app :: State -> Application
-app State{ clientMapRef = cmr } Request{ requestMethod = method, queryString = queryItems, requestBody = body, requestBodyLength = bodyLength }
+app state Request{ requestMethod = method, queryString = queryItems, requestBody = body, requestBodyLength = bodyLength }
   | method == methodGet  = runResourceT . liftIO $ handleGet
   | method == methodPost = handlePost
   | otherwise            = warn "bad method"
   where
 
-    withClient :: (MonadIO m) => BS.ByteString -> (Client -> m Response) -> m Response
-    withClient sid f = case fromString (BS.unpack sid) of
-      Nothing -> warn "sid uuid in bad format"
-      Just s  -> do m'client <- lookupClient s `liftM` liftIO (readIORef cmr)
-                    case m'client of
-                      Nothing -> warn $ "client with SID " ++ show s ++ " is not known"
-                      Just c  -> f c
-
     handleGet = case fromMaybe "" <$> lookup "sid" queryItems of
-      Just querySid -> withClient querySid $ \Client{ mvar } -> respondMvar mvar
+      Just querySid -> warnEither $
+                         withClient state querySid $ \Client{ mvar } -> do
+                           payload <- takeMVar mvar
+                           respondOk (encodePayload payload)
 
-      Nothing -> do
-        -- A new client, put them into the clientMap and wait until they get a message
-        m <- newEmptyMVar
-        newSid <- nextRandom
-        failed <- atomicWithClientMap cmr (addClient (Client m newSid))
-        if failed
-          then warn "client already polling"
-          else do
-            -- STEP-2: Respond OPEN packet
-            -- TODO make parameter
-            -- TODO implement flashsocket, websocket
-            let transports = [Polling] -- TODO should this be "Polling" instead?
-            -- TODO use Builder
-            let openPacket = Packet Open $ Just $ mconcat
-                               [ "{ \"sid\": \"",        sid, "\""
-                               , ", \"upgrades\": ",     upgrades
-                               , ", \"pingTimeout\": ",  pingTimeout
-                               , ", \"pingInterval\": ", pingInterval
-                               , " }"]
-                sid = BS.pack (toString newSid)
-                upgrades = encodeTransports transports
-                -- TODO make parameter
-                -- TODO is this ms? Check protocol
-                pingTimeout  = "1000"
-                pingInterval = "1000"
-
-            respondOk $ encodePayload (Payload [openPacket])
+      Nothing       -> newClient state >>= \case
+                         Left err      -> warn err
+                         Right payload -> respondOk $ encodePayload payload
 
     handlePost = case fromMaybe "" <$> lookup "sid" queryItems of
       Nothing       -> warn "missing sid"
-      Just querySid -> withClient querySid $ \Client{ mvar } -> do
-        case bodyLength of
-          ChunkedBody -> warn "chunked POSTs are not allowed"
-          KnownLength _ -> do
-            allBody <- body $$ sinkLbs -- sinkLBS forces the whole LBS already
-            case decodePayload (BSL.toStrict allBody) of
-              Left err                -> warn err
-              Right (Payload [])      -> warn "no packets in client payload"
-              Right (Payload packets) -> do
-                -- m'response <- msum (map process packets)
-                m'response <- firstM (map process packets)
-                case m'response of
+      Just querySid -> case bodyLength of
+        ChunkedBody   -> warn "chunked POSTs are not allowed"
+        KnownLength _ -> do
+
+          allBody <- body $$ sinkLbs -- sinkLBS forces the whole LBS already
+
+          case decodePayload (BSL.toStrict allBody) of
+            Left err                -> warn err
+            Right (Payload [])      -> warn "no packets in client payload"
+            Right (Payload packets) -> warnEither $
+
+               withClient state querySid $ \Client{ mvar } ->
+
+                -- Stop on first error when processing packets
+                firstM (map (process mvar) packets) >>= \case
+                  Just err -> warn err
                   Nothing  -> respondOk "" -- all fine
-                  Just res -> return res
-                where
-                  process :: Packet -> ResourceT IO (Maybe Response)
-                  process p = case p of
-                    Packet Ping _  -> do liftIO $ putStrLn "responding ping with pong ..."
-                                         liftIO . putMVar mvar $ Payload [Packet Pong Nothing]
-                                         liftIO $ putStrLn "responded pong"
-                                         return Nothing
-                    Packet Close _ -> do liftIO $ putStrLn "received close"
-                                         -- TODO not sure if we should send noop; we have to put something into the mvar
-                                         liftIO . putMVar mvar $ Payload [Packet Noop Nothing]
-                                         return Nothing
-                    Packet typ _   -> Just <$> warn ("unhandled POST packet type " ++ show typ)
-                                      -- don't process remaining packages ps
-
-
-    respondMvar m = do
-      payload <- takeMVar m
-      respondOk (encodePayload payload)
 
     respondOk bs = return $ responseLBS status200 [] bs
 
-    warn msg = do
-      liftIO $ putStrLn msg
-      return $ responseLBS status500 [] (BSL.pack msg) -- TODO send some proper json?
+warn :: (MonadIO m) => String -> m Response
+warn msg = do
+  liftIO $ putStrLn msg
+  return $ responseLBS status500 [] (BSL.pack msg) -- TODO send some proper json?
 
+warnEither :: (MonadIO m) => m (Either String Response) -> m Response
+warnEither = (>>= either warn return)
+
+
+withClient :: (MonadIO m) => State -> SIDBS -> (Client -> m a) -> m (Either String a)
+withClient State{ clientMapRef = cmr } sid f = case fromString (BS.unpack sid) of
+  Nothing -> return . Left $ "sid uuid in bad format"
+  Just s  -> do m'client <- lookupClient s `liftM` liftIO (readIORef cmr)
+                case m'client of
+                  Nothing -> return . Left $ "client with SID " ++ show s ++ " is not known"
+                  Just c  -> Right `liftM` f c
+
+
+-- A new client, put them into the clientMap and wait until they get a message
+newClient :: State -> IO (Either String Payload)
+newClient State{ clientMapRef = cmr } = do
+  m <- newEmptyMVar
+  newSid <- nextRandom
+  failed <- atomicWithClientMap cmr (addClient (Client m newSid))
+  if failed
+    then return $ Left "client already polling"
+    else do
+      -- STEP-2: Respond OPEN packet
+      -- TODO make parameter
+      -- TODO implement flashsocket, websocket
+      let transports = [Polling] -- TODO should this be "Polling" instead?
+      -- TODO use Builder
+      let openPacket = Packet Open $ Just $ mconcat
+                         [ "{ \"sid\": \"",        sid, "\""
+                         , ", \"upgrades\": ",     upgrades
+                         , ", \"pingTimeout\": ",  pingTimeout
+                         , ", \"pingInterval\": ", pingInterval
+                         , " }"]
+          sid = BS.pack (toString newSid)
+          upgrades = encodeTransports transports
+          -- TODO make parameter
+          -- TODO is this ms? Check protocol
+          pingTimeout  = "1000"
+          pingInterval = "1000"
+
+          payload = Payload [openPacket]
+
+      return $ Right payload
+
+process :: (MonadIO m) => MVar Payload -> Packet -> m (Maybe String)
+process mvar p = case p of
+  Packet Ping _  -> do liftIO $ putStrLn "responding ping with pong ..."
+                       liftIO . putMVar mvar $ Payload [Packet Pong Nothing]
+                       liftIO $ putStrLn "responded pong"
+                       return Nothing
+  Packet Close _ -> do liftIO $ putStrLn "received close"
+                       -- TODO not sure if we should send noop; we have to put something into the mvar
+                       liftIO . putMVar mvar $ Payload [Packet Noop Nothing]
+                       return Nothing
+  Packet typ _   -> return . Just $ "unhandled POST packet type " ++ show typ
+                    -- don't process remaining packages ps
 
 -- | Executes the actions until one returns something.
 firstM :: (Monad m) => [m (Maybe a)] -> m (Maybe a)
 firstM []     = return Nothing
 firstM (x:xs) = x >>= maybe (firstM xs) (return . Just)
 
+-- type SID = UUID
+type SIDBS = BS.ByteString
+
+-- class Transport t where
+--   receive :: t ->
+--   send :: t -> SID -> Payload -> IO Bool
 
 data Client = Client
   { mvar :: MVar Payload
