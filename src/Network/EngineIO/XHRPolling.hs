@@ -1,8 +1,6 @@
 {-# LANGUAGE OverloadedStrings, NamedFieldPuns, ExistentialQuantification, LambdaCase #-}
 
-module Network.EngineIO.XHRPolling
-  ( main
-  ) where
+module Network.EngineIO.XHRPolling where
 
 import Network.Wai
 import Data.Monoid
@@ -188,16 +186,53 @@ atomicWithClientMap ref f = atomicModifyIORef ref $ \cm -> case f cm of
   Nothing    -> (cm,    True) -- this is the bad case
 
 
+data SocketIOServer = SocketIOServer
+  { state          :: State
+  , pollingBackend :: Maybe PollingBackend
+  }
+
+data SocketIOSettings = SocketIOSettings
+  { port       :: Int
+  , transports :: [Transport]
+  , onConnect  :: Client -> IO () -- TODO arguments
+  }
+
+defaultSocketIOSettings :: SocketIOSettings
+defaultSocketIOSettings = SocketIOSettings
+  { port       = 1234
+  , transports = [Websocket, Flashsocket, Polling]
+  , onConnect  = const (return ())
+  }
+
+newSocketIOServer :: SocketIOSettings -> IO SocketIOServer
+newSocketIOServer SocketIOSettings{ port, transports } = do
+
+  state <- State <$> newIORef emptyClientMap
+
+  -- Start polling backend
+  m'pollingBackend <- if Polling `elem` transports
+                        then do _ <- forkIO $ run port (app state)
+                                return (Just PollingBackend)
+                        else return Nothing
+
+  return $ SocketIOServer
+    { state          = state
+    , pollingBackend = m'pollingBackend
+    }
+
+data PollingBackend = PollingBackend
+
+
 -- TODO remove
 main :: IO ()
 main = do
-  state <- State <$> newIORef emptyClientMap
+  SocketIOServer{ state } <- newSocketIOServer defaultSocketIOSettings
 
   _ <- forkIO $ forever $ do
     pingAllClients state
     threadDelay 1000000
 
-  run 1234 $ app state
+  return ()
 
   where
     pingAllClients State{ clientMapRef = r } = do
