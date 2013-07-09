@@ -87,22 +87,25 @@ app State{ clientMapRef = cmr } Request{ requestMethod = method, queryString = q
             case decodePayload (BSL.toStrict allBody) of
               Left err                -> warn err
               Right (Payload [])      -> warn "no packets in client payload"
-              Right (Payload packets) -> go packets
+              Right (Payload packets) -> do
+                -- m'response <- msum (map process packets)
+                m'response <- firstM (map process packets)
+                case m'response of
+                  Nothing  -> respondOk "" -- all fine
+                  Just res -> return res
                 where
-                  -- TODO use some maybe construction for this, manual looping bah
-                  go []     = respondOk "" -- all fine
-                  go (p:ps) = do
-                    case p of
-                      Packet Ping _ -> do liftIO $ putStrLn "responding ping with pong ..."
-                                          liftIO . putMVar mvar $ Payload [Packet Pong Nothing]
-                                          liftIO $ putStrLn "responded pong"
-                                          go ps
-                      Packet Close _ -> do liftIO $ putStrLn "received close"
-                                           -- TODO not sure if we should send noop; we have to put something into the mvar
-                                           liftIO . putMVar mvar $ Payload [Packet Noop Nothing]
-                                           go ps
-                      Packet typ _  -> warn $ "unhandled POST packet type " ++ show typ
-                                       -- don't process remaining packages ps
+                  process :: Packet -> ResourceT IO (Maybe Response)
+                  process p = case p of
+                    Packet Ping _  -> do liftIO $ putStrLn "responding ping with pong ..."
+                                         liftIO . putMVar mvar $ Payload [Packet Pong Nothing]
+                                         liftIO $ putStrLn "responded pong"
+                                         return Nothing
+                    Packet Close _ -> do liftIO $ putStrLn "received close"
+                                         -- TODO not sure if we should send noop; we have to put something into the mvar
+                                         liftIO . putMVar mvar $ Payload [Packet Noop Nothing]
+                                         return Nothing
+                    Packet typ _   -> Just <$> warn ("unhandled POST packet type " ++ show typ)
+                                      -- don't process remaining packages ps
 
 
     respondMvar m = do
@@ -114,6 +117,13 @@ app State{ clientMapRef = cmr } Request{ requestMethod = method, queryString = q
     warn msg = do
       liftIO $ putStrLn msg
       return $ responseLBS status500 [] (BSL.pack msg) -- TODO send some proper json?
+
+
+-- | Executes the actions until one returns something.
+firstM :: (Monad m) => [m (Maybe a)] -> m (Maybe a)
+firstM []     = return Nothing
+firstM (x:xs) = x >>= maybe (firstM xs) (return . Just)
+
 
 data Client = Client
   { mvar :: MVar Payload
