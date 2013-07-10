@@ -1,9 +1,10 @@
-{-# LANGUAGE OverloadedStrings, NamedFieldPuns, ExistentialQuantification, LambdaCase #-}
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns, ExistentialQuantification, LambdaCase, GeneralizedNewtypeDeriving #-}
 
 module Network.EngineIO.XHRPolling where
 
 import Network.Wai
 import Data.Monoid
+import Data.Foldable (for_)
 import Data.Conduit
 import Data.Conduit.Binary (sinkLbs)
 import Network.Wai.Handler.Warp
@@ -29,8 +30,8 @@ import Network.EngineIO
 
 -- TODO restrict to /engine.io
 -- STEP-1: Transport establishes a connection
-app :: State -> Application
-app state Request{ requestMethod = method, queryString = queryItems, requestBody = body, requestBodyLength = bodyLength }
+app :: State -> (Client -> IO MessageHandler) -> Application
+app state onConnect Request{ requestMethod = method, queryString = queryItems, requestBody = body, requestBodyLength = bodyLength }
   | method == methodGet  = runResourceT . liftIO $ handleGet
   | method == methodPost = handlePost
   | otherwise            = warn "bad method"
@@ -42,7 +43,7 @@ app state Request{ requestMethod = method, queryString = queryItems, requestBody
                            payload <- takeMVar mvar
                            respondOk (encodePayload payload)
 
-      Nothing       -> newClient state >>= \case
+      Nothing       -> newClient state Polling onConnect >>= \case
                          Left err      -> warn err
                          Right payload -> respondOk $ encodePayload payload
 
@@ -59,10 +60,10 @@ app state Request{ requestMethod = method, queryString = queryItems, requestBody
             Right (Payload [])      -> warn "no packets in client payload"
             Right (Payload packets) -> warnEither $
 
-               withClient state querySid $ \Client{ mvar } ->
+               withClient state querySid $ \client ->
 
                 -- Stop on first error when processing packets
-                firstM (map (process mvar) packets) >>= \case
+                firstM (map (process client) packets) >>= \case
                   Just err -> warn err
                   Nothing  -> respondOk "" -- all fine
 
@@ -87,18 +88,24 @@ withClient State{ clientMapRef = cmr } sid f = case fromString (BS.unpack sid) o
 
 
 -- A new client, put them into the clientMap and wait until they get a message
-newClient :: State -> IO (Either String Payload)
-newClient State{ clientMapRef = cmr } = do
+newClient :: State -> Transport -> (Client -> IO MessageHandler) -> IO (Either String Payload)
+newClient State{ clientMapRef = cmr } transport onConnect = do
   m <- newEmptyMVar
   newSid <- nextRandom
-  failed <- atomicWithClientMap cmr (addClient (Client m newSid))
+  client <- do let clientWithoutHandler = Client m newSid transport Nothing
+               messageHandler <- onConnect clientWithoutHandler
+               return $ clientWithoutHandler { messageHandler = Just messageHandler }
+  failed <- atomicWithClientMap cmr (addClient client)
   if failed
     then return $ Left "client already polling"
     else do
       -- STEP-2: Respond OPEN packet
       -- TODO make parameter
       -- TODO implement flashsocket, websocket
-      let transports = [Polling] -- TODO should this be "Polling" instead?
+      -- The starting transport (Polling) must not be used here (otherwise we
+      -- get probes on an already working transport, for which the client will
+      -- expect immediate responses).
+      let transports = []
       -- TODO use Builder
       let openPacket = Packet Open $ Just $ mconcat
                          [ "{ \"sid\": \"",        sid, "\""
@@ -117,16 +124,21 @@ newClient State{ clientMapRef = cmr } = do
 
       return $ Right payload
 
-process :: (MonadIO m) => MVar Payload -> Packet -> m (Maybe String)
-process mvar p = case p of
-  Packet Ping _  -> do liftIO $ putStrLn "responding ping with pong ..."
-                       liftIO . putMVar mvar $ Payload [Packet Pong Nothing]
-                       liftIO $ putStrLn "responded pong"
-                       return Nothing
+process :: (MonadIO m) => Client -> Packet -> m (Maybe String)
+process Client{ mvar, messageHandler } p = case p of
+  Packet Ping msg  -> do liftIO $ putStrLn "responding ping with pong ..."
+                         liftIO . putMVar mvar $ Payload [Packet Pong msg] -- send back same data
+                         liftIO $ putStrLn "responded pong"
+                         return Nothing
   Packet Close _ -> do liftIO $ putStrLn "received close"
                        -- TODO not sure if we should send noop; we have to put something into the mvar
                        liftIO . putMVar mvar $ Payload [Packet Noop Nothing]
                        return Nothing
+  Packet Message msg -> do liftIO $ putStrLn "received message"
+                           liftIO $ case messageHandler of
+                             Nothing -> putStrLn "BUG: Client got message but has no handler"
+                             Just f  -> for_ msg f
+                           return Nothing
   Packet typ _   -> return . Just $ "unhandled POST packet type " ++ show typ
                     -- don't process remaining packages ps
 
@@ -145,12 +157,15 @@ type SIDBS = BS.ByteString
 data Client = Client
   { mvar :: MVar Payload
   , sid :: UUID
-  } deriving (Eq)
+  , currentTransport :: Transport
+  , messageHandler :: Maybe MessageHandler -- TODO unclean to be here
+  }
+
 
 instance Show Client where
-  show (Client _ sid) = "Client { sid = " ++ show sid ++ " }"
+  show (Client _ sid _ _) = "Client { sid = " ++ show sid ++ " }"
 
-newtype ClientMap = ClientMap (Map UUID Client) deriving (Eq, Show)
+newtype ClientMap = ClientMap (Map UUID Client) deriving (Show)
 
 data State = State
   { clientMapRef :: IORef ClientMap
@@ -186,6 +201,9 @@ atomicWithClientMap ref f = atomicModifyIORef ref $ \cm -> case f cm of
   Nothing    -> (cm,    True) -- this is the bad case
 
 
+type MessageHandler = BS.ByteString -> IO ()
+
+
 data SocketIOServer = SocketIOServer
   { state          :: State
   , pollingBackend :: Maybe PollingBackend
@@ -194,25 +212,26 @@ data SocketIOServer = SocketIOServer
 data SocketIOSettings = SocketIOSettings
   { port       :: Int
   , transports :: [Transport]
-  , onConnect  :: Client -> IO () -- TODO arguments
+  , onConnect  :: Client -> IO MessageHandler
   }
 
 defaultSocketIOSettings :: SocketIOSettings
 defaultSocketIOSettings = SocketIOSettings
   { port       = 1234
   , transports = [Websocket, Flashsocket, Polling]
-  , onConnect  = const (return ())
+  , onConnect  = const $ return (\_ -> return ())
   }
 
 newSocketIOServer :: SocketIOSettings -> IO SocketIOServer
-newSocketIOServer SocketIOSettings{ port, transports } = do
+newSocketIOServer SocketIOSettings{ port, transports, onConnect } = do
 
   state <- State <$> newIORef emptyClientMap
 
   -- Start polling backend
   m'pollingBackend <- if Polling `elem` transports
-                        then do _ <- forkIO $ run port (app state)
-                                return (Just PollingBackend)
+                        then do m <- newEmptyMVar
+                                _ <- forkIO $ run port (app state onConnect) >> putMVar m ()
+                                return (Just $ PollingBackend m)
                         else return Nothing
 
   return $ SocketIOServer
@@ -220,19 +239,32 @@ newSocketIOServer SocketIOSettings{ port, transports } = do
     , pollingBackend = m'pollingBackend
     }
 
+-- TODO change this to `run` and make it actually start everything?
+waitSocketIOServer :: SocketIOServer -> IO ()
+waitSocketIOServer SocketIOServer { pollingBackend } =
+  for_ pollingBackend $ \PollingBackend { finishedMvar = m } ->
+    takeMVar m
+
 data PollingBackend = PollingBackend
+  { finishedMvar :: MVar ()
+  }
 
 
 -- TODO remove
 main :: IO ()
 main = do
-  SocketIOServer{ state } <- newSocketIOServer defaultSocketIOSettings
+  server@SocketIOServer{ state } <- newSocketIOServer defaultSocketIOSettings
+    { onConnect = \_client -> do
+        putStrLn "client connected"
+        return $ \bytes -> do
+          putStrLn $ "client sent: " ++ show bytes
+    }
 
   _ <- forkIO $ forever $ do
     pingAllClients state
     threadDelay 1000000
 
-  return ()
+  waitSocketIOServer server
 
   where
     pingAllClients State{ clientMapRef = r } = do
